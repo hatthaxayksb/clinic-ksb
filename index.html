@@ -1092,7 +1092,8 @@
     } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-auth.js";
     import {
         getFirestore, collection, doc, getDoc, getDocs, addDoc, updateDoc,
-        deleteDoc, setDoc, query, where, orderBy, Timestamp, serverTimestamp
+        deleteDoc, setDoc, query, where, orderBy, Timestamp, serverTimestamp,
+        runTransaction
     } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
 
     // ⚠️ apiKey ນີ້ບໍ່ແມ່ນຄວາມລັບ — ປອດໄພທີ່ຈະຝັງໄວ້ໃນໂຄດ, ຄວາມປອດໄພແທ້ຈິງຢູ່ທີ່ Firestore Security Rules
@@ -1224,6 +1225,44 @@
         return new Date(parseInt(parts[2],10), parseInt(parts[1],10)-1, parseInt(parts[0],10));
     }
 
+    // ຕົວນັບເລກທີ່ບິນກາງ — ໃຊ້ Firestore Transaction ຮັບປະກັນຮຽງລຳດັບແທ້ໆ
+    // ຮູບແບບ: INV-YYYYMM-NNN — ຕົວນັບ (NNN) ແລ່ນຕໍ່ເນື່ອງຕະຫຼອດປີ (ຂ້າມເດືອນໄດ້ບໍ່ຣີເຊັດ)
+    // ຈະຣີເຊັດເປັນ 001 ໃໝ່ອັດຕະໂນມັດຕອນຂຶ້ນປີໃໝ່ ເທົ່ານັ້ນ (ຕົວນັບແຍກ counter ຕໍ່ 1 ປີ)
+    async function fbGetNextBillNumber() {
+        const now  = new Date();
+        const yyyy = now.getFullYear();
+        const mm   = String(now.getMonth() + 1).padStart(2, '0');
+        const counterRef = doc(fbDb, 'counters', 'bills_' + yyyy);
+
+        // ຄັ້ງທຳອິດຂອງແຕ່ລະປີ (ຍັງບໍ່ເຄີຍສ້າງ counter ປີນີ້ມາກ່ອນ) — bootstrap ອັດຕະໂນມັດຈາກ
+        // ຄ່າສູງສຸດຂອງບິນທີ່ມີວັນທີຢູ່ໃນປີດຽວກັນ ເພື່ອບໍ່ໃຫ້ເລກຍ້ອນກັບໄປເລີ່ມ 1 ຄືນ (ຊ້ຳກັບບິນເກົ່າ)
+        const existing = await getDoc(counterRef);
+        if (!existing.exists()) {
+            const startOfYear = Timestamp.fromDate(new Date(yyyy, 0, 1));
+            const endOfYear   = Timestamp.fromDate(new Date(yyyy + 1, 0, 1));
+            const q = query(collection(fbDb, 'bills'), where('date', '>=', startOfYear), where('date', '<', endOfYear));
+            const snap = await getDocs(q);
+            let max = 0;
+            snap.forEach(d => {
+                const no = String(d.data().no || '');
+                const m = no.match(/-(\d+)$/);
+                if (m) {
+                    const n = parseInt(m[1], 10);
+                    if (n > max) max = n;
+                }
+            });
+            await setDoc(counterRef, { next: max + 1 }, { merge: true });
+        }
+
+        const assigned = await runTransaction(fbDb, async (tx) => {
+            const snap = await tx.get(counterRef);
+            const current = snap.exists() ? (snap.data().next || 1) : 1;
+            tx.set(counterRef, { next: current + 1 }, { merge: true });
+            return current;
+        });
+        return { assigned, yyyy, mm };
+    }
+
     async function fbSaveBill(bill) {
         const items = bill.items || [];
         const meds  = bill.medicines || [];
@@ -1332,6 +1371,7 @@
         logout: fbLogout,
         sendPasswordReset: fbSendPasswordReset,
         getBills: fbGetBills,
+        getNextBillNumber: fbGetNextBillNumber,
         saveBill: fbSaveBill,
         updateBill: fbUpdateBill,
         deleteBill: fbDeleteBill,
@@ -1379,6 +1419,20 @@ const GAS_URL = "https://script.google.com/macros/s/AKfycbyB2xKxBZuqyojU3vF4gEsN
     let globalMedicineDatabase = []; // ດຶງຈາກ Firestore
     let invoiceHistory = [];
     let currentInvoiceData = null;
+    // ຄິດເລກທີ່ບິນຕໍ່ໄປ ຈາກຄ່າສູງສຸດຂອງ "ທຸກ" ບິນ (ບໍ່ແມ່ນແຄ່ບິນລ່າສຸດຕາມລຳດັບ array)
+    // ປ້ອງກັນເລກຊ້ຳ/ຂ້າມ ຖ້າວັນທີບິນບໍ່ຮຽງລຳດັບກັນເປັ๊ະ (ເຊັ່ນ ບິນຈາກ migration)
+    function computeNextBillCount() {
+        let max = 0;
+        invoiceHistory.forEach(b => {
+            const match = String(b.no || '').match(/-(\d+)$/);
+            if (match) {
+                const n = parseInt(match[1], 10);
+                if (n > max) max = n;
+            }
+        });
+        return max + 1;
+    }
+
     let billCount = 1;
 
     /* ===== GOOGLE SHEETS HELPERS ===== */
@@ -1588,12 +1642,8 @@ const GAS_URL = "https://script.google.com/macros/s/AKfycbyB2xKxBZuqyojU3vF4gEsN
                     medicines:  b.medicines || []
                 };
             });
-            // ຕັ້ງ billCount ຕໍ່ຈາກເລກລ່າສຸດ
-            if (invoiceHistory.length > 0) {
-                const lastNo = invoiceHistory[invoiceHistory.length-1].no || '';
-                const match  = lastNo.match(/-(\d+)$/);
-                if (match) billCount = parseInt(match[1]) + 1;
-            }
+            // ຕັ້ງ billCount ຈາກຄ່າສູງສຸດຂອງທຸກບິນ (ບໍ່ອີງໃສ່ລຳດັບ array)
+            billCount = computeNextBillCount();
             console.log('✅ loadBills OK (Firestore):', invoiceHistory.length, 'bills');
             renderCustomerDropdown();
             initAutoDateTimeAndBillNo();
@@ -1631,7 +1681,8 @@ const GAS_URL = "https://script.google.com/macros/s/AKfycbyB2xKxBZuqyojU3vF4gEsN
         document.getElementById('inDate').value = `${dd}/${mm}/${yyyy}`;
         const manual = document.getElementById('inNoManual') && document.getElementById('inNoManual').checked;
         if (!manual) {
-            document.getElementById('inNo').value = `INV-${yyyy}${mm}${dd}-${String(billCount).padStart(3,'0')}`;
+            // ໝາຍເຫດ: ນີ້ແມ່ນຄ່າ preview ຄາດຄະເນເທົ່ານັ້ນ — ເລກທີ່ບິນຈິງຈະຖືກອອກໃຫ້ຈາກຕົວນັບກາງໃນ Firestore ຕອນກົດ "ພິມ+ບັນທຶກ"
+            document.getElementById('inNo').value = `INV-${yyyy}${mm}-${String(billCount).padStart(3,'0')}`;
         }
     }
 
@@ -1797,6 +1848,10 @@ const GAS_URL = "https://script.google.com/macros/s/AKfycbyB2xKxBZuqyojU3vF4gEsN
         btn.classList.add('active');
         ['invoiceRender','printAreaBtn','paperSelector'].forEach(id => document.getElementById(id).style.display = 'none');
         if (menuId === 'menu-settings') openSettingsTab();
+        if (menuId === 'menu-sales' && !document.getElementById('inNoManual')?.checked) {
+            billCount = computeNextBillCount();
+            initAutoDateTimeAndBillNo();
+        }
     }
 
     function renderMedicineDatabase() {
@@ -2164,13 +2219,32 @@ const GAS_URL = "https://script.google.com/macros/s/AKfycbyB2xKxBZuqyojU3vF4gEsN
     async function printAndSaveInvoice() {
         if (!currentInvoiceData) return;
 
-        // ປ້ອງກັນເລກທີ່ບິນຊ້ຳ (ໃຊ້ໄດ້ທັງໂໝດອັດຕະໂນມັດ ແລະ ພິມເອງ)
-        const billNoTrimmed = String(currentInvoiceData.no || '').trim();
-        if (!billNoTrimmed) { alert('⚠️ ກະລຸນາປ້ອນເລກທີ່ບິນ!'); return; }
-        const isDup = invoiceHistory.some(b => String(b.no || '').trim().toLowerCase() === billNoTrimmed.toLowerCase());
-        if (isDup) {
-            alert('⚠️ ເລກທີ່ບິນ "' + billNoTrimmed + '" ມີຢູ່ແລ້ວໃນລະບົບ!\nກະລຸນາປ່ຽນເລກທີ່ບິນ ຫຼື ຍົກເລີກຕິກ "ພິມເລກທີ່ບິນເອງ" ເພື່ອໃຫ້ລະບົບສ້າງເລກທີ່ໃໝ່ໃຫ້ອັດຕະໂນມັດ');
-            return;
+        const isManual = document.getElementById('inNoManual')?.checked;
+        let billNoTrimmed = String(currentInvoiceData.no || '').trim();
+
+        if (isManual) {
+            // ໂໝດພິມເອງ — ກວດຊ້ຳກັບປະຫວັດທີ່ໂຫຼດໄວ້ (ບໍ່ຮັບປະກັນ 100% ຖ້າຫຼາຍຄົນພິມພ້ອມກັນ, ແຕ່ພຽງພໍສຳລັບກໍລະນີພິມເອງ)
+            if (!billNoTrimmed) { alert('⚠️ ກະລຸນາປ້ອນເລກທີ່ບິນ!'); return; }
+            const isDup = invoiceHistory.some(b => String(b.no || '').trim().toLowerCase() === billNoTrimmed.toLowerCase());
+            if (isDup) {
+                alert('⚠️ ເລກທີ່ບິນ "' + billNoTrimmed + '" ມີຢູ່ແລ້ວໃນລະບົບ!\nກະລຸນາປ່ຽນເລກທີ່ບິນ ຫຼື ຍົກເລີກຕິກ "ພິມເລກທີ່ບິນເອງ" ເພື່ອໃຫ້ລະບົບສ້າງເລກທີ່ໃໝ່ໃຫ້ອັດຕະໂນມັດ');
+                return;
+            }
+        } else {
+            // ໂໝດອັດຕະໂນມັດ — ໃຊ້ຕົວນັບກາງໃນ Firestore (Transaction) ຮັບປະກັນຮຽງລຳດັບແທ້ໆ
+            showSyncStatus('⏳ ກຳລັງອອກເລກທີ່ບິນ...', '#2563eb');
+            let result;
+            try {
+                result = await window.Firebase.getNextBillNumber();
+            } catch(e) {
+                console.error('getNextBillNumber error', e);
+                alert('❌ ອອກເລກທີ່ບິນຜິດພາດ — ກວດ internet ແລ້ວລອງໃໝ່');
+                return;
+            }
+            // ຮູບແບບ: INV-YYYYMM-NNN — ຕົວນັບແລ່ນຕໍ່ເນື່ອງຕະຫຼອດປີ, ຣີເຊັດ 001 ຕອນຂຶ້ນປີໃໝ່ເທົ່ານັ້ນ
+            billNoTrimmed = `INV-${result.yyyy}${result.mm}-${String(result.assigned).padStart(3, '0')}`;
+            currentInvoiceData.no = billNoTrimmed;
+            document.getElementById('outNo').innerText = billNoTrimmed; // ອັບເດດເລກທີ່ຢູ່ໃນໃບບິນ preview ກ່ອນພິມ
         }
 
         // ເກັບ reference ກ່ອນ reset ລ້າງ currentInvoiceData
@@ -2197,7 +2271,7 @@ const GAS_URL = "https://script.google.com/macros/s/AKfycbyB2xKxBZuqyojU3vF4gEsN
             renderCustomerTable();
             window.Firebase.saveCustomer(newCust).catch(e => console.error('saveCustomer error', e));
         }
-        billCount++;
+        billCount = computeNextBillCount(); // ໃຊ້ສະເພາະສະແດງຄາດຄະເນ preview ຄັ້ງຕໍ່ໄປ (ບໍ່ໄດ້ໃຊ້ຕັດສິນເລກທີ່ບິນຈິງອີກຕໍ່ໄປ)
         renderHistory();
         resetMainForm();
 
